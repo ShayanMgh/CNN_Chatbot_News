@@ -59,3 +59,5 @@ import asyncio
 asyncio.run(demo())
 
 all_tools = tools + [tool_push]
+
+llm = Ollama(model="llama3.2")
