@@ -10,6 +10,8 @@ import requests
 import os
 from langchain.agents import Tool
 from langchain_community.llms import Ollama
+from langgraph.checkpoint.memory import MemorySaver
+
 
 # -- your push notification tool stays the same --
 load_dotenv()
@@ -61,3 +63,26 @@ asyncio.run(demo())
 all_tools = tools + [tool_push]
 
 llm = Ollama(model="llama3.2")
+
+# LangChain LlamaCpp supports bind_tools() just like ChatOpenAI
+llm_with_tools = llm.bind_tools(all_tools)
+
+# --- rest of your state‐graph/chatbot setup unchanged ---
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+graph_builder = StateGraph(State)
+
+def chatbot(state: State):
+    # invoke the Llama model (with tools)
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+
+graph_builder.add_node("chatbot", chatbot)
+graph_builder.add_node("tools", ToolNode(tools=all_tools))
+graph_builder.add_conditional_edges("chatbot", tools_condition, "tools")
+graph_builder.add_edge("tools", "chatbot")
+graph_builder.add_edge(START, "chatbot")
+
+memory = MemorySaver()
+graph = graph_builder.compile(checkpointer=memory)
