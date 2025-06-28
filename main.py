@@ -86,3 +86,18 @@ graph_builder.add_edge(START, "chatbot")
 
 memory = MemorySaver()
 graph = graph_builder.compile(checkpointer=memory)
+
+# show the flow
+display(Image(graph.get_graph().draw_mermaid_png()))
+
+config = {"configurable": {"thread_id": "10"}}
+
+async def chat(user_input: str, history):
+    result = await graph.ainvoke(
+        {"messages": [{"role": "user", "content": user_input}]},
+        config=config
+    )
+    return result["messages"][-1].content
+
+# launch the Gradio UI
+gr.ChatInterface(chat, type="messages").launch()
