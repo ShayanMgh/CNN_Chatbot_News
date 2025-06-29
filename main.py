@@ -1,103 +1,109 @@
+
 from typing import Annotated
 from typing_extensions import TypedDict
-from langgraph.graph import StateGraph, START
-from langgraph.graph.message import add_messages
-from dotenv import load_dotenv
-from IPython.display import Image, display
-import gradio as gr
-from langgraph.prebuilt import ToolNode, tools_condition
-import requests
 import os
-from langchain.agents import Tool
-from langchain_community.llms import Ollama
-from langgraph.checkpoint.memory import MemorySaver
-
-
-# -- your push notification tool stays the same --
-load_dotenv()
-pushover_token = os.getenv("PUSHOVER_TOKEN")
-pushover_user  = os.getenv("PUSHOVER_USER")
-pushover_url   = "https://api.pushover.net/1/messages.json"
-
-def push(text: str):
-    """Send a push notification to the user"""
-    requests.post(
-        pushover_url,
-        data={
-            "token": pushover_token,
-            "user": pushover_user,
-            "message": text
-        }
-    )
-
-tool_push = Tool(
-    name="send_push_notification",
-    func=push,
-    description="Useful for when you want to send a push notification"
-)
-
-# -- async playwright setup unchanged --
+import requests
+from dotenv import load_dotenv
 import nest_asyncio
-nest_asyncio.apply()
+import gradio as gr
 
+from langchain.agents import Tool, initialize_agent, AgentType
+from langchain_ollama import OllamaLLM
+from langchain.memory import ConversationBufferMemory
 from langchain_community.agent_toolkits import PlayWrightBrowserToolkit
 from langchain_community.tools.playwright.utils import create_async_playwright_browser
+from langgraph.graph import StateGraph, START
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
 
-async_browser = create_async_playwright_browser(headless=False)
-toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=async_browser)
-tools = toolkit.get_tools()
-tool_dict = {t.name: t for t in tools}
+# ---------------------------------------------------------------------------
+# 1. Load environment & configure Pushover
+# ---------------------------------------------------------------------------
+load_dotenv()
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN")
+PUSHOVER_USER  = os.getenv("PUSHOVER_USER")
+PUSHOVER_URL   = "https://api.pushover.net/1/messages.json"
 
-navigate_tool     = tool_dict["navigate_browser"]
-extract_text_tool = tool_dict["extract_text"]
+def push(text: str):
+    """Send a push notification via Pushover."""
+    resp = requests.post(
+        PUSHOVER_URL,
+        data={"token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "message": text},
+        timeout=10
+    )
+    resp.raise_for_status()
 
-# example usage
-async def demo():
-    await navigate_tool.arun({"url": "https://www.cnn.com"})
-    text = await extract_text_tool.arun({})
-    print(text[:500])
+push_tool = Tool(
+    name="send_push_notification",
+    func=push,
+    description="Send a push notification via Pushover"
+)
 
-import asyncio
-asyncio.run(demo())
+# ---------------------------------------------------------------------------
+# 2. Setup Playwright browser tools
+# ---------------------------------------------------------------------------
+nest_asyncio.apply()
+async_browser = create_async_playwright_browser(headless=True)
+playwright_toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=async_browser)
+# Restrict to the single-input browse tools
+BROWSER_TOOL_NAMES = {"navigate_browser", "extract_text"}
+browser_tools = [t for t in playwright_toolkit.get_tools() if t.name in BROWSER_TOOL_NAMES]
 
-all_tools = tools + [tool_push]
+# Combine all tools
+TOOLS = browser_tools + [push_tool]
 
-llm = Ollama(model="llama3.2")
+# ---------------------------------------------------------------------------
+# 3. Initialize local Llama model via Ollama
+# ---------------------------------------------------------------------------
+llm = OllamaLLM(model="llama3.2")
 
-# LangChain LlamaCpp supports bind_tools() just like ChatOpenAI
-llm_with_tools = llm.bind_tools(all_tools)
+# ---------------------------------------------------------------------------
+# 4. Initialize a structured-chat agent for multi-input support
+# ---------------------------------------------------------------------------
+agent = initialize_agent(
+    llm=llm,
+    tools=TOOLS,
+    agent_type=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+    memory=ConversationBufferMemory(memory_key="chat_history", return_messages=True),
+    verbose=False,
+)
 
-# --- rest of your state‐graph/chatbot setup unchanged ---
+# ---------------------------------------------------------------------------
+# 5. LangGraph flow: wrap agent in a graph
+# ---------------------------------------------------------------------------
 class State(TypedDict):
     messages: Annotated[list, add_messages]
 
-graph_builder = StateGraph(State)
+builder = StateGraph(State)
 
-def chatbot(state: State):
-    # invoke the Llama model (with tools)
-    response = llm_with_tools.invoke(state["messages"])
-    return {"messages": [response]}
+async def chatbot_node(state: State):
+    user_msg = state["messages"][-1]["content"]
+    reply = agent.run(user_msg)
+    return {"messages": [{"role": "assistant", "content": reply}]}
 
-graph_builder.add_node("chatbot", chatbot)
-graph_builder.add_node("tools", ToolNode(tools=all_tools))
-graph_builder.add_conditional_edges("chatbot", tools_condition, "tools")
-graph_builder.add_edge("tools", "chatbot")
-graph_builder.add_edge(START, "chatbot")
+builder.add_node("chatbot", chatbot_node)
+builder.add_edge(START, "chatbot")
+builder.add_edge("chatbot", "chatbot")
 
-memory = MemorySaver()
-graph = graph_builder.compile(checkpointer=memory)
+memory_ckpt = MemorySaver()
+CHAT_GRAPH = builder.compile(checkpointer=memory_ckpt)
 
-# show the flow
-display(Image(graph.get_graph().draw_mermaid_png()))
-
+# ---------------------------------------------------------------------------
+# 6. Gradio chat interface
+# ---------------------------------------------------------------------------
 config = {"configurable": {"thread_id": "10"}}
 
-async def chat(user_input: str, history):
-    result = await graph.ainvoke(
+async def chat_fn(user_input: str, history):
+    out = await CHAT_GRAPH.ainvoke(
         {"messages": [{"role": "user", "content": user_input}]},
         config=config
     )
-    return result["messages"][-1].content
+    return out["messages"][-1].content
 
-# launch the Gradio UI
-gr.ChatInterface(chat, type="messages").launch()
+
+def main():
+    gr.ChatInterface(chat_fn, type="messages").launch()
+
+if __name__ == "__main__":
+    main()
+
